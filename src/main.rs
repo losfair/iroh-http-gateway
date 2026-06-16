@@ -74,6 +74,7 @@ struct Args {
 #[derive(Clone)]
 struct Gateway {
     endpoint: Endpoint,
+    endpoint_id: String,
     base_domain: Option<String>,
     api_hostname: Option<String>,
 }
@@ -190,8 +191,9 @@ async fn main() -> anyhow::Result<()> {
 
     let endpoint = builder.bind().await?;
     let own_endpoint_id = endpoint.id();
+    let own_endpoint_id_base32 = endpoint_id_to_base32(&own_endpoint_id);
     info!(
-        endpoint_id = %endpoint_id_to_base32(&own_endpoint_id),
+        endpoint_id = %own_endpoint_id_base32,
         endpoint_id_hex = %own_endpoint_id,
         "local iroh endpoint bound"
     );
@@ -208,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
 
     let gateway = Arc::new(Gateway {
         endpoint,
+        endpoint_id: own_endpoint_id_base32,
         base_domain: args.base_domain.as_deref().map(normalize_domain),
         api_hostname: args.api_hostname.as_deref().map(normalize_domain),
     });
@@ -335,15 +338,17 @@ impl Gateway {
     }
 
     fn serve_api(&self, req: &Request<Incoming>) -> Response<GatewayBody> {
-        match translate_ticket_request(req) {
-            Ok(endpoint_id) => {
-                let mut resp = Response::new(full(format!("{endpoint_id}\n")));
-                resp.headers_mut().insert(
-                    http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain; charset=utf-8"),
-                );
-                resp
-            }
+        match api_request(req, &self.endpoint_id) {
+            Ok(ApiResponse::Json(json)) => response_with_content_type(
+                StatusCode::OK,
+                json,
+                HeaderValue::from_static("application/json"),
+            ),
+            Ok(ApiResponse::Text(text)) => response_with_content_type(
+                StatusCode::OK,
+                text,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
             Err(err) => error_response(err.status, err.message),
         }
     }
@@ -460,7 +465,12 @@ fn parse_endpoint_id_label(label: &str) -> Result<EndpointId, GatewayError> {
         .map_err(|err| GatewayError::bad_request(format!("invalid endpoint id: {err}")))
 }
 
-fn translate_ticket_request<B>(req: &Request<B>) -> Result<String, GatewayError> {
+enum ApiResponse {
+    Json(String),
+    Text(String),
+}
+
+fn api_request<B>(req: &Request<B>, endpoint_id: &str) -> Result<ApiResponse, GatewayError> {
     if req.method() != Method::GET {
         return Err(GatewayError {
             status: StatusCode::METHOD_NOT_ALLOWED,
@@ -468,13 +478,19 @@ fn translate_ticket_request<B>(req: &Request<B>) -> Result<String, GatewayError>
         });
     }
 
-    if req.uri().path() != "/translate" {
-        return Err(GatewayError {
+    match req.uri().path() {
+        "/info" => Ok(ApiResponse::Json(format!(
+            "{{\"endpoint_id\":\"{endpoint_id}\"}}\n"
+        ))),
+        "/translate" => translate_ticket_request(req).map(ApiResponse::Text),
+        _ => Err(GatewayError {
             status: StatusCode::NOT_FOUND,
             message: "not found".to_owned(),
-        });
+        }),
     }
+}
 
+fn translate_ticket_request<B>(req: &Request<B>) -> Result<String, GatewayError> {
     let ticket = req
         .uri()
         .query()
@@ -503,6 +519,18 @@ fn normalize_domain(domain: &str) -> String {
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response<GatewayBody> {
     let mut resp = Response::new(full(message.into()));
     *resp.status_mut() = status;
+    resp
+}
+
+fn response_with_content_type(
+    status: StatusCode,
+    body: impl Into<String>,
+    content_type: HeaderValue,
+) -> Response<GatewayBody> {
+    let mut resp = Response::new(full(body.into()));
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(http::header::CONTENT_TYPE, content_type);
     resp
 }
 
@@ -580,6 +608,24 @@ mod tests {
             translate_ticket_request(&req).unwrap(),
             endpoint_id_to_base32(&endpoint_id)
         );
+    }
+
+    #[test]
+    fn info_api_returns_endpoint_id_json() {
+        let key = SecretKey::generate();
+        let endpoint_id = endpoint_id_to_base32(&key.public());
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/info")
+            .body(())
+            .unwrap();
+
+        match api_request(&req, &endpoint_id).unwrap() {
+            ApiResponse::Json(json) => {
+                assert_eq!(json, format!("{{\"endpoint_id\":\"{endpoint_id}\"}}\n"));
+            }
+            ApiResponse::Text(_) => panic!("expected JSON response"),
+        }
     }
 
     #[test]

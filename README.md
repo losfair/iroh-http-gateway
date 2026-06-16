@@ -54,8 +54,15 @@ cargo run -- \
   --api-hostname api.example.com
 ```
 
-Requests to `--api-hostname` take precedence over gateway routing. The translate
-endpoint returns a lowercase unpadded RFC4648 base32 endpoint ID as `text/plain`:
+Requests to `--api-hostname` take precedence over gateway routing. `/info`
+returns the gateway node's own endpoint ID as JSON:
+
+```sh
+curl 'http://api.example.com/info'
+```
+
+The translate endpoint returns a lowercase unpadded RFC4648 base32 endpoint ID
+as `text/plain`:
 
 ```sh
 curl 'http://api.example.com/translate?ticket=<dumbpipe-ticket>'
