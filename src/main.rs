@@ -13,7 +13,6 @@ use std::{
 use anyhow::Context as _;
 use bytes::Bytes;
 use clap::Parser;
-use data_encoding::BASE32_NOPAD;
 use http::{HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
@@ -191,9 +190,9 @@ async fn main() -> anyhow::Result<()> {
 
     let endpoint = builder.bind().await?;
     let own_endpoint_id = endpoint.id();
-    let own_endpoint_id_base32 = endpoint_id_to_base32(&own_endpoint_id);
+    let own_endpoint_id_z32 = endpoint_id_to_z32(&own_endpoint_id);
     info!(
-        endpoint_id = %own_endpoint_id_base32,
+        endpoint_id = %own_endpoint_id_z32,
         endpoint_id_hex = %own_endpoint_id,
         "local iroh endpoint bound"
     );
@@ -210,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
 
     let gateway = Arc::new(Gateway {
         endpoint,
-        endpoint_id: own_endpoint_id_base32,
+        endpoint_id: own_endpoint_id_z32,
         base_domain: args.base_domain.as_deref().map(normalize_domain),
         api_hostname: args.api_hostname.as_deref().map(normalize_domain),
     });
@@ -406,7 +405,7 @@ fn endpoint_label_from_host(host: &str, base_domain: Option<&str>) -> Result<Str
             };
             if label.contains('.') || label.is_empty() {
                 return Err(GatewayError::bad_request(
-                    "Host must be <base32-endpoint-id>.<base-domain>",
+                    "Host must be <z32-endpoint-id>.<base-domain>",
                 ));
             }
             Ok(label.to_owned())
@@ -440,29 +439,55 @@ fn normalize_host(host: &str) -> String {
 fn parse_endpoint_id_label(label: &str) -> Result<EndpointId, GatewayError> {
     if label.len() != 52 {
         return Err(GatewayError::bad_request(
-            "endpoint-id label must be 52 base32 characters",
+            "endpoint-id label must be 52 z32 characters",
         ));
     }
 
-    if !label
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
-    {
+    if !label.bytes().all(is_z32_char) {
         return Err(GatewayError::bad_request(
-            "endpoint-id label must use lowercase RFC4648 base32 characters",
+            "endpoint-id label must use lowercase z-base-32 characters",
         ));
     }
 
-    let input = label.to_ascii_uppercase();
-    let bytes = BASE32_NOPAD
-        .decode(input.as_bytes())
-        .map_err(|err| GatewayError::bad_request(format!("invalid endpoint id base32: {err}")))?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| GatewayError::bad_request("endpoint-id label must decode to 32 bytes"))?;
-
-    EndpointId::from_bytes(&bytes)
+    EndpointId::from_z32(label)
         .map_err(|err| GatewayError::bad_request(format!("invalid endpoint id: {err}")))
+}
+
+fn is_z32_char(ch: u8) -> bool {
+    matches!(
+        ch,
+        b'y' | b'b'
+            | b'n'
+            | b'd'
+            | b'r'
+            | b'f'
+            | b'g'
+            | b'8'
+            | b'e'
+            | b'j'
+            | b'k'
+            | b'm'
+            | b'c'
+            | b'p'
+            | b'q'
+            | b'x'
+            | b'o'
+            | b't'
+            | b'1'
+            | b'u'
+            | b'w'
+            | b'i'
+            | b's'
+            | b'z'
+            | b'a'
+            | b'3'
+            | b'4'
+            | b'5'
+            | b'h'
+            | b'7'
+            | b'6'
+            | b'9'
+    )
 }
 
 enum ApiResponse {
@@ -503,13 +528,11 @@ fn translate_ticket_request<B>(req: &Request<B>) -> Result<String, GatewayError>
 
     let ticket = dumbpipe::EndpointTicket::from_str(&ticket)
         .map_err(|err| GatewayError::bad_request(format!("invalid ticket: {err}")))?;
-    Ok(endpoint_id_to_base32(&ticket.endpoint_addr().id))
+    Ok(endpoint_id_to_z32(&ticket.endpoint_addr().id))
 }
 
-fn endpoint_id_to_base32(endpoint_id: &EndpointId) -> String {
-    BASE32_NOPAD
-        .encode(endpoint_id.as_bytes())
-        .to_ascii_lowercase()
+fn endpoint_id_to_z32(endpoint_id: &EndpointId) -> String {
+    endpoint_id.to_z32()
 }
 
 fn normalize_domain(domain: &str) -> String {
@@ -546,27 +569,29 @@ mod tests {
 
     #[test]
     fn parses_endpoint_label_from_host_with_base_domain() {
-        let label = "hwpbkwcfcubxe4fwu5u5eobrsbwyfwiokk5qahza3edvwuqqfbma";
+        let key = SecretKey::generate();
+        let label = endpoint_id_to_z32(&key.public());
         let host = format!("{label}.example.com:8080");
 
         assert_eq!(
             endpoint_label_from_host(&host, Some("example.com"))
                 .unwrap()
                 .as_str(),
-            label
+            label.as_str()
         );
     }
 
     #[test]
     fn rejects_extra_subdomain_when_base_domain_is_configured() {
-        let label = "hwpbkwcfcubxe4fwu5u5eobrsbwyfwiokk5qahza3edvwuqqfbma";
+        let key = SecretKey::generate();
+        let label = endpoint_id_to_z32(&key.public());
         let host = format!("extra.{label}.example.com");
 
         assert!(endpoint_label_from_host(&host, Some("example.com")).is_err());
     }
 
     #[test]
-    fn rejects_non_base32_endpoint_label() {
+    fn rejects_non_z32_endpoint_label() {
         let label = "hwpbkwcfcubxe4fwu5u5eobrsbwyfwiokk5qahza3edvwuqqfbm0";
 
         assert!(parse_endpoint_id_label(label).is_err());
@@ -575,7 +600,7 @@ mod tests {
     #[test]
     fn accepts_uppercase_host_label() {
         let key = SecretKey::generate();
-        let label = endpoint_id_to_base32(&key.public());
+        let label = endpoint_id_to_z32(&key.public());
         let host = format!("{}.EXAMPLE.COM", label.to_ascii_uppercase());
 
         let parsed_label = endpoint_label_from_host(&host, Some("example.com")).unwrap();
@@ -587,13 +612,13 @@ mod tests {
     #[test]
     fn accepts_generated_endpoint_id_display() {
         let key = SecretKey::generate();
-        let label = endpoint_id_to_base32(&key.public());
+        let label = endpoint_id_to_z32(&key.public());
 
         parse_endpoint_id_label(&label).unwrap();
     }
 
     #[test]
-    fn translates_dumbpipe_ticket_to_base32_endpoint_id() {
+    fn translates_dumbpipe_ticket_to_z32_endpoint_id() {
         let key = SecretKey::generate();
         let endpoint_id = key.public();
         let ticket = dumbpipe::EndpointTicket::new(EndpointAddr::new(endpoint_id));
@@ -606,14 +631,14 @@ mod tests {
 
         assert_eq!(
             translate_ticket_request(&req).unwrap(),
-            endpoint_id_to_base32(&endpoint_id)
+            endpoint_id_to_z32(&endpoint_id)
         );
     }
 
     #[test]
     fn info_api_returns_endpoint_id_json() {
         let key = SecretKey::generate();
-        let endpoint_id = endpoint_id_to_base32(&key.public());
+        let endpoint_id = endpoint_id_to_z32(&key.public());
         let req = Request::builder()
             .method(Method::GET)
             .uri("/info")

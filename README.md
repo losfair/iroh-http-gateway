@@ -7,12 +7,12 @@ HTTP/1.1 gateway for services exposed with
 Incoming requests are routed by the left-most DNS label:
 
 ```text
-http://<base32-encoded-32-byte-endpoint-id>.example.com/
+http://<z32-encoded-32-byte-endpoint-id>.example.com/
 ```
 
 For each request, the gateway:
 
-1. extracts the 52-character lowercase base32 iroh endpoint ID from `Host`,
+1. extracts the 52-character lowercase z-base-32 iroh endpoint ID from `Host`,
 2. dials that endpoint with `dumbpipe::ALPN`,
 3. opens one bidirectional stream,
 4. writes the dumbpipe handshake, and
@@ -45,7 +45,7 @@ curl http://<endpoint-id>.example.com/
 ## Ticket Translation API
 
 Dumbpipe prints endpoint tickets by default. To expose a gateway-local API that
-turns those tickets into hostname-safe endpoint IDs, configure an API hostname:
+turns those tickets into hostname-safe z32 endpoint IDs, configure an API hostname:
 
 ```sh
 cargo run -- \
@@ -61,8 +61,7 @@ returns the gateway node's own endpoint ID as JSON:
 curl 'http://api.example.com/info'
 ```
 
-The translate endpoint returns a lowercase unpadded RFC4648 base32 endpoint ID
-as `text/plain`:
+The translate endpoint returns a lowercase z-base-32 endpoint ID as `text/plain`:
 
 ```sh
 curl 'http://api.example.com/translate?ticket=<dumbpipe-ticket>'
