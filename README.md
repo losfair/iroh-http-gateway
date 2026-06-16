@@ -24,6 +24,12 @@ For each request, the gateway:
 cargo run -- --listen 0.0.0.0:8080 --base-domain example.com
 ```
 
+`--listen` also accepts Unix socket paths:
+
+```sh
+cargo run -- --listen /tmp/iroh-http-gateway.sock --base-domain example.com
+```
+
 Run the remote node with dumbpipe, forwarding to an HTTP service:
 
 ```sh
@@ -59,8 +65,8 @@ Set `IROH_SECRET` or pass `--iroh-secret` with a hex-encoded iroh secret key to
 make the gateway's iroh endpoint stable across restarts. Without one, an
 ephemeral key is generated and emitted in the startup logs.
 
-Logs are emitted with the `tracing` crate as JSON Lines. Set `RUST_LOG` to tune
-verbosity:
+Logs are emitted with the `tracing` crate as JSON Lines. On startup, the gateway
+logs its own iroh endpoint ID as `endpoint_id`. Set `RUST_LOG` to tune verbosity:
 
 ```sh
 RUST_LOG=iroh_http_gateway=debug,iroh=info cargo run -- --base-domain example.com
@@ -69,7 +75,7 @@ RUST_LOG=iroh_http_gateway=debug,iroh=info cargo run -- --base-domain example.co
 Useful options:
 
 ```text
---listen <ADDR>               HTTP listen address, default 0.0.0.0:8080
+--listen <ADDR|PATH>           HTTP TCP listen address or Unix socket path, default 0.0.0.0:8080
 --base-domain <DOMAIN>        require hosts to match <endpoint-id>.<DOMAIN>
 --api-hostname <HOSTNAME>     serve local API routes on this exact hostname
 --iroh-ipv4-addr <ADDR>       iroh IPv4 bind address

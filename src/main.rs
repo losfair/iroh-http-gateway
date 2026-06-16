@@ -4,6 +4,7 @@ use std::{
     convert::Infallible,
     fmt,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -21,7 +22,11 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::presets};
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::{TcpListener, UnixListener},
+    time::timeout,
+};
 use tracing::{debug, info, warn};
 
 use crate::iroh_stream::IrohStream;
@@ -31,9 +36,12 @@ type GatewayBody = BoxBody<Bytes, hyper::Error>;
 #[derive(Parser, Debug)]
 #[command(about = "HTTP/1.1 gateway for dumbpipe services addressed by iroh endpoint ID")]
 struct Args {
-    /// HTTP socket address to listen on.
+    /// HTTP listen address.
+    ///
+    /// Values that parse as socket addresses bind TCP. Other values are treated
+    /// as Unix socket paths. Unix paths may optionally be prefixed with unix:.
     #[arg(long, default_value = "0.0.0.0:8080")]
-    listen: SocketAddr,
+    listen: ListenAddr,
 
     /// Optional base domain to require after the endpoint-id label, e.g. example.com.
     #[arg(long)]
@@ -68,6 +76,65 @@ struct Gateway {
     endpoint: Endpoint,
     base_domain: Option<String>,
     api_hostname: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ListenAddr {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+impl FromStr for ListenAddr {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Ok(addr) = value.parse::<SocketAddr>() {
+            return Ok(Self::Tcp(addr));
+        }
+
+        let path = value.strip_prefix("unix:").unwrap_or(value);
+        if path.is_empty() {
+            return Err("listen value must be a TCP socket address or Unix socket path".to_owned());
+        }
+
+        Ok(Self::Unix(PathBuf::from(path)))
+    }
+}
+
+impl fmt::Display for ListenAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(addr) => write!(f, "{addr}"),
+            Self::Unix(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
+enum Listener {
+    Tcp(TcpListener),
+    Unix(UnixListener),
+}
+
+impl Listener {
+    async fn bind(addr: &ListenAddr) -> std::io::Result<Self> {
+        match addr {
+            ListenAddr::Tcp(addr) => TcpListener::bind(addr).await.map(Self::Tcp),
+            ListenAddr::Unix(path) => UnixListener::bind(path).map(Self::Unix),
+        }
+    }
+
+    fn local_addr(&self) -> String {
+        match self {
+            Self::Tcp(listener) => match listener.local_addr() {
+                Ok(addr) => addr.to_string(),
+                Err(err) => format!("<unknown tcp address: {err}>"),
+            },
+            Self::Unix(listener) => match listener.local_addr() {
+                Ok(addr) => unix_socket_addr_display(&addr),
+                Err(err) => format!("<unknown unix socket address: {err}>"),
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -122,6 +189,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let endpoint = builder.bind().await?;
+    let own_endpoint_id = endpoint.id();
+    info!(
+        endpoint_id = %endpoint_id_to_base32(&own_endpoint_id),
+        endpoint_id_hex = %own_endpoint_id,
+        "local iroh endpoint bound"
+    );
+
     if timeout(
         Duration::from_millis(args.online_timeout_ms),
         endpoint.online(),
@@ -138,31 +212,55 @@ async fn main() -> anyhow::Result<()> {
         api_hostname: args.api_hostname.as_deref().map(normalize_domain),
     });
 
-    let listener = TcpListener::bind(args.listen).await?;
-    let local_addr = listener.local_addr()?;
-    info!("listening on http://{local_addr}");
+    let listener = Listener::bind(&args.listen).await?;
+    let local_addr = listener.local_addr();
+    info!(listen = %local_addr, "listening for HTTP/1.1 requests");
 
     loop {
-        let (stream, remote_addr) = listener.accept().await?;
-        let gateway = Arc::clone(&gateway);
-
-        tokio::spawn(async move {
-            debug!(%remote_addr, "accepted HTTP connection");
-            let service = service_fn(move |req| {
-                let gateway = Arc::clone(&gateway);
-                async move { Ok::<_, Infallible>(gateway.serve(req).await) }
-            });
-
-            if let Err(err) = server_http1::Builder::new()
-                .preserve_header_case(true)
-                .title_case_headers(true)
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
-                warn!(%remote_addr, error = %err, "HTTP connection failed");
+        match &listener {
+            Listener::Tcp(listener) => {
+                let (stream, remote_addr) = listener.accept().await?;
+                spawn_http_connection(stream, remote_addr.to_string(), Arc::clone(&gateway));
             }
-        });
+            Listener::Unix(listener) => {
+                let (stream, remote_addr) = listener.accept().await?;
+                spawn_http_connection(
+                    stream,
+                    unix_socket_addr_display(&remote_addr),
+                    Arc::clone(&gateway),
+                );
+            }
+        }
     }
+}
+
+fn spawn_http_connection<S>(stream: S, remote_addr: String, gateway: Arc<Gateway>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        debug!(%remote_addr, "accepted HTTP connection");
+        let service = service_fn(move |req| {
+            let gateway = Arc::clone(&gateway);
+            async move { Ok::<_, Infallible>(gateway.serve(req).await) }
+        });
+
+        if let Err(err) = server_http1::Builder::new()
+            .preserve_header_case(true)
+            .title_case_headers(true)
+            .serve_connection(TokioIo::new(stream), service)
+            .await
+        {
+            warn!(%remote_addr, error = %err, "HTTP connection failed");
+        }
+    });
+}
+
+fn unix_socket_addr_display(addr: &tokio::net::unix::SocketAddr) -> String {
+    addr.as_pathname()
+        .map(Path::display)
+        .map(|display| format!("unix:{display}"))
+        .unwrap_or_else(|| "<unnamed unix socket>".to_owned())
 }
 
 impl Gateway {
@@ -481,6 +579,28 @@ mod tests {
         assert_eq!(
             translate_ticket_request(&req).unwrap(),
             endpoint_id_to_base32(&endpoint_id)
+        );
+    }
+
+    #[test]
+    fn parses_tcp_listen_addr() {
+        assert_eq!(
+            "127.0.0.1:8080".parse::<ListenAddr>().unwrap(),
+            ListenAddr::Tcp("127.0.0.1:8080".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parses_unix_listen_addr() {
+        assert_eq!(
+            "/tmp/iroh-http-gateway.sock".parse::<ListenAddr>().unwrap(),
+            ListenAddr::Unix(PathBuf::from("/tmp/iroh-http-gateway.sock"))
+        );
+        assert_eq!(
+            "unix:/tmp/iroh-http-gateway.sock"
+                .parse::<ListenAddr>()
+                .unwrap(),
+            ListenAddr::Unix(PathBuf::from("/tmp/iroh-http-gateway.sock"))
         );
     }
 }
